@@ -1,0 +1,366 @@
+/* Jason Hack
+   W00979077
+   12/6/2014
+   CSCI 330
+   Assignment 3
+   
+   The purpose of this program is read from a database using SQL, to compare the stocks in a given industry
+   to all the other stocks in the industry, and output to a different database, a table containing returns for
+   how the stocks performed relative to each other over 60 day intervals.
+*/
+
+import java.util.*;
+import java.io.FileInputStream;
+import java.sql.*;
+
+class Assign3 {
+    static Connection conn = null;
+    static Connection conn2 = null;
+    public static void main(String[] args) throws Exception {
+        // Get connection properties
+        String readerFile = "readerparams.txt";
+        String writerFile = "writerparams.txt";
+        Properties readerprops = new Properties();
+        Properties writerprops = new Properties();
+        readerprops.load(new FileInputStream(readerFile));
+        writerprops.load(new FileInputStream(writerFile));
+        
+        try {
+            // Get connection
+            Class.forName("com.mysql.jdbc.Driver");
+            
+            String dburl = readerprops.getProperty("dburl");
+            String username = readerprops.getProperty("user");
+            conn = DriverManager.getConnection(dburl, readerprops);
+            System.out.printf("Reader connection %s %s established.%n", dburl, username);
+            
+            String dburl2 = writerprops.getProperty("dburl");
+            String username2 = writerprops.getProperty("user");
+            conn2 = DriverManager.getConnection(dburl2, writerprops);
+            System.out.printf("Writer connection %s %s established.%n", dburl2, username2);
+            processIndustry();
+        } catch (SQLException ex) {
+            System.out.printf("SQLException: %s%nSQLState: %s%nVendorError: %s%n",
+            ex.getMessage(), ex.getSQLState(), ex.getErrorCode());
+        }
+    }
+    
+    // This method prints out the industries being processed
+    static void showIndustry(ResultSet rs) throws SQLException {
+        rs.last();
+        int count = rs.getRow();
+        rs.beforeFirst();
+        System.out.println(count + " industries found");
+        while (rs.next()) {
+            System.out.println(rs.getString(1));
+        }
+    }
+    
+    // This method creates the Performance table we will be inserting our processed data into and 
+    // finds each industry we will be processing, then processes them one by one.
+    static void processIndustry()throws SQLException {
+        String query;
+        PreparedStatement pstmt;
+        PreparedStatement pstmtCreate = null;
+        query = "drop table if exists Performance";
+        pstmtCreate = conn2.prepareStatement(query);
+        pstmtCreate.executeUpdate();
+        
+        query = "create table Performance ( " +
+                     "Industry CHAR(30), " +
+                     "Ticker CHAR(6), " +
+                     "StartDate CHAR(10), " +
+                     "EndDate CHAR(10), " +
+                     "TickerReturn CHAR(12), " +
+                     "IndustryReturn CHAR(12) )";
+        pstmtCreate = conn2.prepareStatement(query);
+        pstmtCreate.executeUpdate();
+        query = "select Industry, count(distinct Ticker) as TickerCnt " + 
+                    "from Company natural join PriceVolume " +
+                    "group by Industry " +
+                    "order by Industry";
+        pstmt = conn.prepareStatement(query);
+        ResultSet rs = pstmt.executeQuery();
+        showIndustry(rs);
+        rs.beforeFirst();
+        while (rs.next()) {
+            examineIndustry(rs.getString(1), rs.getInt(2));
+            
+        }
+    }
+    
+    // This method does most of the intermediary work of the program. It finds the data in the date range 
+    // that we will be processing for the industry, and finds data values based off of this data
+    // for use in the other methods of the program.
+    static void examineIndustry(String industry, int days) throws SQLException {
+        System.out.println("Processing " + industry);
+        String query;
+        PreparedStatement pstmt;
+        // This statement finds the range of the dates with which we will compare the stocks
+        query = "select max(minTran), min(maxTran) from " +
+                     "(select Ticker, min(TransDate) as minTran, max(TransDate) as maxTran, " +
+                        "count(distinct TransDate) as TradingDays " +
+                     "from Company natural left outer join PriceVolume " +
+                     "where Industry = ? " +
+                     "group by Ticker " +
+                     "having TradingDays >= 150 " +
+                     "order by Ticker) as v1 ";
+        pstmt = conn.prepareStatement(query);
+        pstmt.setString(1, industry);
+        ResultSet rs = pstmt.executeQuery();
+        rs.next();
+        // This statement finds all the tickers, and the number of trading days for each ticker withen the range
+        query = "select Ticker, min(TransDate), max(TransDate), count(distinct TransDate) as TradingDays " +
+                    "from Company natural left outer join PriceVolume " +
+                    "where Industry = ? " +
+                    "and TransDate >= ? and TransDate <= ? " +
+                    "group by Ticker " +
+                    "having TradingDays >= 150 " +
+                    "order by Ticker ";
+        
+        pstmt = conn.prepareStatement(query);
+        pstmt.setString(1, industry);
+        String firstDay = rs.getString(1);
+        String lastDay = rs.getString(2);
+        pstmt.setString(2, firstDay);
+        pstmt.setString(3, lastDay);
+        ResultSet tickerTradingDays = pstmt.executeQuery();
+        // if the current industry does not meet the criteria to be processed, quit processing
+        if (!tickerTradingDays.isBeforeFirst() ) { 
+            return;
+        }
+
+        tickerTradingDays.last();
+        int numStocks = tickerTradingDays.getRow();
+        tickerTradingDays.beforeFirst();
+        // map to keep track of divisor values for each stock. Used to calculate stock splits.
+        Map<String, Double> divisorMap = new HashMap<String, Double>();  
+        // map to keep track of the previous open value for each stock. Used to calculate stock splits
+        Map<String, Double> prevOpenMap = new HashMap<String, Double>(); 
+        int min = Integer.MAX_VALUE;
+        while (tickerTradingDays.next()) {
+            divisorMap.put(tickerTradingDays.getString(1), 1.0);
+            prevOpenMap.put(tickerTradingDays.getString(1), -1.0);
+            if(tickerTradingDays.getInt(4) < min)
+                min = tickerTradingDays.getInt(4); // finds the mininum number of trading days for the industry
+        }
+        tickerTradingDays.first();
+        int intervals = min / 60;
+        // This statement selects the transaction date and open/close prices for the alphebetically first ticker
+        // This data is used to find the trading intervals
+        query = "select P.TransDate, P.openPrice, P.closePrice " +
+                  "from PriceVolume P " +
+                  "where Ticker = ? and TransDate >= ? and TransDate <= ?";
+        
+      
+        pstmt = conn.prepareStatement(query);
+        pstmt.setString(1, tickerTradingDays.getString(1)); // The alphebetically first ticker
+        pstmt.setString(2, firstDay);
+        pstmt.setString(3, lastDay);
+        ResultSet firstData = pstmt.executeQuery();
+        Object[][] firstIntervals = new Object[intervals][5];
+        firstIntervals = findIntervals(firstData, intervals);
+        
+        ResultSet priceData = findPriceData(industry, firstDay, lastDay);
+        priceData.last();
+        int numRows = priceData.getRow();
+        priceData.beforeFirst();
+        Object[][] updatedValues = new Object[numRows][4];
+        Object[][] tickerReturn = new Object[intervals * numStocks][5];
+        
+        updatedValues = adjustForSplits(priceData, numRows, prevOpenMap, divisorMap);
+        tickerReturn = findTickerReturns(firstIntervals, updatedValues, intervals, numStocks, numRows);
+        outputToTable(tickerReturn, firstIntervals, intervals, numStocks, industry);
+    }
+    
+    // This method finds the trading intervals for each industry determined by the trading days 
+    // of the alphebetically first ticker in the industry. It then returns a two dimensional
+    // object array with the columns denoting the interval number, beginning day number,
+    // start date, ending day number, and ending date for the interval.
+    static Object[][] findIntervals(ResultSet firstData, int intervals) throws SQLException {
+        Object[][] firstIntervals = new Object[intervals][5];
+        int intval = 1;
+        int day = 1;
+        while(firstData.next() && intval <= intervals) {
+            if(((day - 1) % 60) == 0) {
+                firstIntervals[intval - 1][0] = intval;
+                firstIntervals[intval - 1][1] = day;
+                firstIntervals[intval - 1][2] = firstData.getString(1);
+                for(int i = 0; i < 59; i++) {
+                    firstData.next();
+                }
+                day += 59;
+                firstIntervals[intval - 1][3] = day;
+                firstIntervals[intval - 1][4] = firstData.getString(1);
+                intval++;
+            }
+            day++;
+        }
+        return firstIntervals;
+    } 
+      
+    // This method selects the ticker, date, and open and close prices for each trading day, 
+    // for each stock that we are evaluating, and returns the corresponding result set.
+    static ResultSet findPriceData(String industry, String firstDay, String lastDay) throws SQLException {
+        String query;
+        PreparedStatement pstmt;
+        query = "select C.Ticker, P.TransDate, P.openPrice, P.closePrice " +
+                         "from Company as C natural left outer join PriceVolume as P " +
+                         "where Industry = ? " +
+                             "and TransDate >= ? and TransDate <= ? " +
+                             "and C.Ticker in " +
+                             "(select Ticker from (select Ticker, count(distinct TransDate) as TradingDays " +
+                                "from Company natural left outer join PriceVolume " +
+                                "where Industry = ? " +
+                                    "and TransDate >= ? and TransDate <= ? " +
+                                "group by Ticker " +
+                                "having TradingDays >= 150) as v1) " +
+                         "order by TransDate DESC, Ticker DESC";
+        pstmt = conn.prepareStatement(query);
+        pstmt.setString(1, industry);
+        pstmt.setString(2, firstDay);
+        pstmt.setString(3, lastDay);
+        pstmt.setString(4, industry);
+        pstmt.setString(5, firstDay);
+        pstmt.setString(6, lastDay);
+        ResultSet priceData = pstmt.executeQuery();
+        return priceData;
+    }
+    
+    // This method adjusts the data for each stock to account for stock splits, and returns 
+    // the updated data in a two dimensional object array with the columns representing
+    // the ticker, current date, and updated start/end prices.
+    static Object[][] adjustForSplits(ResultSet priceData, int numRows, Map<String, Double> prevOpenMap, 
+                                      Map<String, Double> divisorMap) throws SQLException {
+        Object[][] updatedValues = new Object[numRows][4];
+        while (priceData.next()) {
+            int rowNum = priceData.getRow();
+            String currTicker = priceData.getString(1);
+            String currDate = priceData.getString(2);
+            double currOpen = priceData.getDouble(3);
+            double currClose = priceData.getDouble(4);
+            double prevOpen = prevOpenMap.get(currTicker);
+            double divisor = divisorMap.get(currTicker);
+            // Finds 3:1 stock splits
+            if(Math.abs((currClose / prevOpen - 3.0)) < 0.30) {
+                divisor = divisor * 3.0;
+                divisorMap.put(currTicker, divisor);
+            }
+            // Finds 2:1 stock splits
+            else if( Math.abs((currClose / prevOpen - 2.0)) < 0.20) {
+                divisor = divisor * 2.0;
+                divisorMap.put(currTicker, divisor);
+            }
+            // Finds 3:2 stock splits
+            else if( Math.abs((currClose / prevOpen - 1.5)) < 0.15) {
+                divisor = divisor * 1.5;
+                divisorMap.put(currTicker, divisor);
+            }
+            prevOpenMap.put(currTicker, currOpen);
+            if(divisor > 1.0) {
+                updatedValues[rowNum - 1][0] = priceData.getString(1);
+                updatedValues[rowNum - 1][1] = priceData.getString(2);
+                updatedValues[rowNum - 1][2] = priceData.getDouble(3) / divisor;
+                updatedValues[rowNum - 1][3] = priceData.getDouble(4) / divisor;
+            }
+            else{
+                updatedValues[rowNum - 1][0] = priceData.getString(1);
+                updatedValues[rowNum - 1][1] = priceData.getString(2);
+                updatedValues[rowNum - 1][2] = priceData.getDouble(3);
+                updatedValues[rowNum - 1][3] = priceData.getDouble(4);
+            }
+        }
+        return updatedValues;
+    }
+    
+    // This method finds the start and ending trading date for each stock in each interval, and calculates  
+    // the tickerReturn for each stock. it then returns a two dimensional object array with the columns 
+    // representing the current interval, current ticker, open price, close price, and the ticker return.
+    static Object[][] findTickerReturns(Object[][] firstIntervals, Object[][] updatedValues, 
+                                        int intervals, int numStocks, int numRows) throws SQLException {
+        int currentInterval = 0;
+        int count = 0;
+        // This map keeps track of the last observed closing price for each ticker
+        Map<String, Double> lastDayClose = new HashMap<String, Double>();
+        // This array holds the value for the ticker return for each stock in the interval
+        Object[][] tickerReturn = new Object[intervals * numStocks][5];
+        for(int i = numRows - 1; i >= 0; i--) {
+            // if we are on the last interval, take care of the special case
+            if(currentInterval == intervals) {
+                if(firstIntervals[currentInterval - 1][4].equals(updatedValues[i][1])) {
+                    while(firstIntervals[currentInterval - 1][4].equals(updatedValues[i][1])) {
+                        lastDayClose.put((String) updatedValues[i][0], (Double) updatedValues[i][3]); 
+                        i--;
+                    }
+                    for(int j = 0; j < numStocks; j++) {
+                        // calculate the ticker return for the stocks in the last interval
+                        tickerReturn[count - numStocks][3] = lastDayClose.get(tickerReturn[count - numStocks][1]);
+                        double returnValue = (Double) tickerReturn[count - numStocks][3] / (Double) tickerReturn[count - numStocks][2];
+                        tickerReturn[count - numStocks][4] = returnValue;
+                        count++;
+                    }
+                }
+            }
+            // If we found the first day of the new interval
+            else if(firstIntervals[currentInterval][2].equals(updatedValues[i][1])) {
+                currentInterval++;
+                // this array keeps track to see if we have already gotten a value for a stock in the interval
+                ArrayList<String> list = new ArrayList<String>(numStocks);
+                while (list.size() < numStocks) {
+                    String stock = (String)updatedValues[i][0];
+                    // If this is the first appearance of the stock in the new interval
+                    if(!list.contains(stock)) {
+                        list.add(stock);
+                        tickerReturn[count][0] = currentInterval;
+                        tickerReturn[count][1] = stock;
+                        tickerReturn[count][2] = updatedValues[i][2];
+                        if(currentInterval != 1) {
+                            // calculate the ticker return for the stock in the previous interval
+                            tickerReturn[count - numStocks][3] = lastDayClose.get(stock);
+                            double returnValue = (Double) tickerReturn[count - numStocks][3] / (Double) tickerReturn[count - numStocks][2];
+                            tickerReturn[count - numStocks][4] = returnValue; 
+                        }
+                        count++;
+                    }
+                    i--;
+                }
+            }
+            lastDayClose.put((String) updatedValues[i][0], (Double) updatedValues[i][3]);              
+        }
+        return tickerReturn;
+    }
+    
+    // This method, given the organized data, outputs the industry, ticker, start date, end date, 
+    // ticker return, and industry return for each stock in each trading interval       
+    static void outputToTable(Object[][] tickerReturn, Object[][] firstIntervals, int intervals, 
+                                int numStocks, String industry) throws SQLException {
+        Double[] sumTickerReturn = new Double[intervals];
+        for(int i = 0; i < intervals * numStocks; i++) {
+            int index = ((Integer) tickerReturn[i][0]) - 1;
+            if(sumTickerReturn[index] == null)
+                sumTickerReturn[index] = (Double) tickerReturn[i][4];
+            else
+                sumTickerReturn[index] += (Double) tickerReturn[i][4];
+        }
+        PreparedStatement insertValues = null;
+        String query;
+        // Insert data for each stock, in each interval into the Performance table
+        for(int i = 0; i < intervals * numStocks; i++) {
+            query = "INSERT INTO Performance " +
+                        "VALUES (?, ?, ?, ?, ?, ?)";
+            insertValues = conn2.prepareStatement(query);
+            insertValues.setString(1, industry);
+            insertValues.setString(2, (String)tickerReturn[i][1]);
+            int interval2 = (Integer)tickerReturn[i][0];
+            insertValues.setString(3, (String)firstIntervals[interval2 - 1][2]);
+            insertValues.setString(4, (String)firstIntervals[interval2 - 1][4]);
+            double tickerReturnValue = (Double)tickerReturn[i][4] - 1.0;
+            String tickerReturnFormat = String.format("%10.7f", tickerReturnValue);
+            insertValues.setString(5,tickerReturnFormat);
+            double industryReturnValue = (1.0/(numStocks - 1) * ((Double)sumTickerReturn[interval2 - 1] - (Double)tickerReturn[i][4])) - 1;
+            String industryReturnFormat = String.format("%10.7f", industryReturnValue);
+            insertValues.setString(6, industryReturnFormat);
+            insertValues.executeUpdate();
+        }
+    }
+}
