@@ -4,13 +4,6 @@
  * Implements methods for iteratively learning words from a
  * character-segmented text file, and then evaluating how good they are
  *
- * Students may only use functionality provided in the packages
- *     java.lang
- *     java.util
- *     java.io
- *
- * Use of any additional Java Class Library components is not permitted
- *
  * April 2014
  *
  * Authors:   Jason Hack
