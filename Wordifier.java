@@ -239,7 +239,6 @@ public class Wordifier {
          System.exit(1);
       }
 		return dictionaryWords;
-
    }
 
     // incrementHashMap
