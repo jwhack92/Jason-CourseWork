@@ -8,7 +8,6 @@
  *
  * Authors:   Jason Hack
  *            Omar Juma
- *
  */
 
 import java.util.LinkedList;
