@@ -1,5 +1,4 @@
 //Jason Hack
-// CSCI 247
 
 #include "mmu.h"
 #include <stdio.h>
